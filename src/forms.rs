@@ -1,6 +1,7 @@
 //! Basic non-JavaScript HTML form support. Not a complete HTML Living Standard implementation.
 use scraper::{Html, Selector, ElementRef};
 use url::Url;
+use std::io::Read;
 
 #[derive(Clone, Debug)]
 pub struct Control {
@@ -107,7 +108,7 @@ pub fn submit(form: &Form, submit_index: Option<usize>) -> Result<(String, Strin
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Mozilla/5.0 (compatible; AsterBrowser/0.2)")
         .build().map_err(|e| e.to_string())?;
-    let response = if form.method == "POST" {
+    let mut response = if form.method == "POST" {
         if form.enctype.starts_with("multipart/form-data") {
             let mut multipart = reqwest::blocking::multipart::Form::new();
             for (name, value) in fields { multipart = multipart.text(name, value); }
@@ -128,7 +129,9 @@ pub fn submit(form: &Form, submit_index: Option<usize>) -> Result<(String, Strin
     if response.content_length().is_some_and(|n| n > 8 * 1024 * 1024) {
         return Err("Response exceeds 8 MiB safety limit".into());
     }
-    let bytes = response.bytes().map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    // FIX: stream no more than 8 MiB + 1 byte; Content-Length may be absent.
+    (&mut response).take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     if bytes.len() > 8 * 1024 * 1024 { return Err("Response exceeds 8 MiB safety limit".into()); }
     let html = String::from_utf8_lossy(&bytes).into_owned();
     Ok((final_url, html, status))
