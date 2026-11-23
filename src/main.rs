@@ -4,12 +4,12 @@ use fltk::{
     frame::Frame, group::Flex, input::Input, prelude::*, text::{TextBuffer, TextDisplay},
     window::Window,
 };
-use std::{cell::RefCell, rc::Rc, sync::mpsc, thread, time::Duration};
+use std::{cell::RefCell, rc::Rc, sync::{mpsc, atomic::{AtomicU64, Ordering}}, thread, time::Duration};
 use url::Url;
 use scraper::{Html, Selector};
 
 #[derive(Clone)]
-struct Page { url: String, title: String, body: String, status: String, forms: Vec<forms::Form>, links: Vec<(String, String)> }
+struct Page { request_id: u64, url: String, title: String, body: String, status: String, forms: Vec<forms::Form>, links: Vec<(String, String)> }
 
 // Search prefixes: ddg:, google:, bing:, brave:, yahoo:, ecosia:, startpage:.
 fn resolve_address(input: &str) -> String {
@@ -67,7 +67,7 @@ fn fetch_page(input: String) -> Page { fetch_page_inner(unwrap_search_redirect(&
 
 fn fetch_page_inner(input: String, redirect_depth: u8) -> Page {
     let url = unwrap_search_redirect(&resolve_address(&input));
-    let error = |message: String| Page { url: url.clone(), title: "Error".into(), body: message.clone(), status: message, forms: Vec::new(), links: Vec::new() };
+    let error = |message: String| Page { request_id: 0, url: url.clone(), title: "Error".into(), body: message.clone(), status: message, forms: Vec::new(), links: Vec::new() };
     let parsed = match Url::parse(&url) { Ok(u) => u, Err(e) => return error(e.to_string()) };
     if !matches!(parsed.scheme(), "http" | "https") { return error("Only HTTP and HTTPS are supported".into()); }
     let client = match reqwest::blocking::Client::builder()
@@ -79,7 +79,13 @@ fn fetch_page_inner(input: String, redirect_depth: u8) -> Page {
     let response = match client.get(parsed).send() { Ok(r) => r, Err(e) => return error(e.to_string()) };
     let code = response.status();
     let final_url = response.url().to_string();
-    let html = match response.text() { Ok(t) => t, Err(e) => return error(e.to_string()) };
+    // FIX: reject oversized responses before allocating a page-sized string.
+    if response.content_length().is_some_and(|n| n > 8 * 1024 * 1024) {
+        return error("Page exceeds 8 MiB safety limit".into());
+    }
+    let bytes = match response.bytes() { Ok(b) => b, Err(e) => return error(e.to_string()) };
+    if bytes.len() > 8 * 1024 * 1024 { return error("Page exceeds 8 MiB safety limit".into()); }
+    let html = String::from_utf8_lossy(&bytes).into_owned();
     if redirect_depth == 0 {
         if let Some(target) = duckduckgo_lite_redirect(&final_url, &html) {
             return fetch_page_inner(target, 1);
@@ -87,7 +93,7 @@ fn fetch_page_inner(input: String, redirect_depth: u8) -> Page {
     }
     let title = extract_title(&html).unwrap_or_else(|| final_url.clone());
     let body = plain_text(&html);
-    Page { url: final_url.clone(), title, body, forms: forms::parse(&html, &final_url), links: extract_links(&html, &final_url), status: format!("HTTP {code} · HTML forms available · JavaScript disabled") }
+    Page { request_id: 0, url: final_url.clone(), title, body, forms: forms::parse(&html, &final_url), links: extract_links(&html, &final_url), status: format!("HTTP {code} · HTML forms available · JavaScript disabled") }
 }
 
 fn duckduckgo_lite_redirect(url: &str, html: &str) -> Option<String> {
@@ -107,10 +113,10 @@ fn submit_form(form: forms::Form, selected: Option<usize>) -> Page {
             let title = extract_title(&html).unwrap_or_else(|| url.clone());
             let body = plain_text(&html);
             let forms = forms::parse(&html, &url);
-            Page { links: extract_links(&html, &url), url, title, body, forms, status: format!("HTTP {status} · form submitted") }
+            Page { request_id: 0, links: extract_links(&html, &url), url, title, body, forms, status: format!("HTTP {status} · form submitted") }
         }
         Err(message) => Page {
-            url: form.action, title: "Form error".into(), body: message.clone(),
+            request_id: 0, url: form.action, title: "Form error".into(), body: message.clone(),
             status: message, forms: Vec::new(), links: Vec::new()
         }
     }
@@ -120,7 +126,7 @@ fn extract_links(html: &str, base: &str) -> Vec<(String, String)> {
     let doc = Html::parse_document(html);
     let all = Selector::parse("a[href]").unwrap();
     let base = match Url::parse(base) { Ok(u) => u, Err(_) => return Vec::new() };
-    let duckduckgo = base.host_str().map(|h| h.ends_with("duckduckgo.com")).unwrap_or(false);
+    let duckduckgo = base.host_str().map(|h| h == "duckduckgo.com" || h.ends_with(".duckduckgo.com")).unwrap_or(false);
     let mut links = Vec::new();
     for a in doc.select(&all) {
         if duckduckgo && !a.value().classes().any(|c| c == "result-link" || c == "result__a") {
@@ -226,18 +232,26 @@ fn main() {
     let (tx, rx) = mpsc::channel::<Page>();
     let (wake_tx, wake_rx) = app::channel::<()>();
     let history = Rc::new(RefCell::new(Vec::<String>::new()));
+    let current_url = Rc::new(RefCell::new(String::new()));
+    let request_counter = std::sync::Arc::new(AtomicU64::new(0));
 
     let link_targets = Rc::new(RefCell::new(Vec::<String>::new()));
     let navigate = {
         let tx = tx.clone();
         let wake_tx = wake_tx.clone();
         let history = history.clone();
+        let current_url = current_url.clone();
+        let request_counter = request_counter.clone();
         move |input: String| {
-            history.borrow_mut().push(input.clone());
+            // FIX: history records the previous displayed page, not the requested input.
+            let previous = current_url.borrow().clone();
+            if !previous.is_empty() && previous != input { history.borrow_mut().push(previous); }
+            let request_id = request_counter.fetch_add(1, Ordering::SeqCst) + 1;
             let tx = tx.clone();
             let wake = wake_tx.clone();
             thread::spawn(move || {
-                let page = fetch_page(input);
+                let mut page = fetch_page(input);
+                page.request_id = request_id;
                 let _ = tx.send(page);
                 wake.send(());
             });
@@ -256,16 +270,22 @@ fn main() {
         address_input.set_callback(move |_| navigate(address_for_callback.value()));
     }
     {
-        let navigate = navigate.clone();
+        let tx = tx.clone();
+        let wake = wake_tx.clone();
         let history = history.clone();
+        let request_counter = request_counter.clone();
         back.set_callback(move |_| {
-            let mut h = history.borrow_mut();
-            if h.len() > 1 {
-                h.pop();
-                if let Some(previous) = h.pop() {
-                    drop(h);
-                    navigate(previous);
-                }
+            // FIX: don't re-add the current page when navigating backward.
+            if let Some(previous) = history.borrow_mut().pop() {
+                let id = request_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let tx = tx.clone();
+                let wake = wake.clone();
+                thread::spawn(move || {
+                    let mut page = fetch_page(previous);
+                    page.request_id = id;
+                    let _ = tx.send(page);
+                    wake.send(());
+                });
             }
         });
     }
@@ -285,6 +305,9 @@ fn main() {
     while app.wait() {
         if wake_rx.recv().is_some() {
             while let Ok(page) = rx.try_recv() {
+                // FIX: ignore stale responses from slower, earlier requests.
+                if page.request_id != request_counter.load(Ordering::SeqCst) { continue; }
+                *current_url.borrow_mut() = page.url.clone();
                 links_view.clear();
                 link_targets.borrow_mut().clear();
                 for (title, url) in &page.links {
