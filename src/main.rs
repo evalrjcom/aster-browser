@@ -1,14 +1,15 @@
 mod forms;
 use fltk::{
-    app, button::Button, enums::{Align, CallbackTrigger, Color, Font},
+    app, browser::HoldBrowser, button::Button, enums::{Align, CallbackTrigger, Color, Font},
     frame::Frame, group::Flex, input::Input, prelude::*, text::{TextBuffer, TextDisplay},
     window::Window,
 };
 use std::{cell::RefCell, rc::Rc, sync::mpsc, thread, time::Duration};
 use url::Url;
+use scraper::{Html, Selector};
 
 #[derive(Clone)]
-struct Page { url: String, title: String, body: String, status: String, forms: Vec<forms::Form> }
+struct Page { url: String, title: String, body: String, status: String, forms: Vec<forms::Form>, links: Vec<(String, String)> }
 
 fn fetch_page(input: String) -> Page { fetch_page_inner(input, 0) }
 
@@ -20,7 +21,7 @@ fn fetch_page_inner(input: String, redirect_depth: u8) -> Page {
         u.query_pairs_mut().append_pair("q", &input);
         u.to_string()
     };
-    let error = |message: String| Page { url: url.clone(), title: "Error".into(), body: message.clone(), status: message, forms: Vec::new() };
+    let error = |message: String| Page { url: url.clone(), title: "Error".into(), body: message.clone(), status: message, forms: Vec::new(), links: Vec::new() };
     let parsed = match Url::parse(&url) { Ok(u) => u, Err(e) => return error(e.to_string()) };
     if !matches!(parsed.scheme(), "http" | "https") { return error("Only HTTP and HTTPS are supported".into()); }
     let client = match reqwest::blocking::Client::builder()
@@ -40,7 +41,7 @@ fn fetch_page_inner(input: String, redirect_depth: u8) -> Page {
     }
     let title = extract_title(&html).unwrap_or_else(|| final_url.clone());
     let body = plain_text(&html);
-    Page { url: final_url.clone(), title, body, forms: forms::parse(&html, &final_url), status: format!("HTTP {code} · HTML forms available · JavaScript disabled") }
+    Page { url: final_url.clone(), title, body, forms: forms::parse(&html, &final_url), links: extract_links(&html, &final_url), status: format!("HTTP {code} · HTML forms available · JavaScript disabled") }
 }
 
 fn duckduckgo_lite_redirect(url: &str, html: &str) -> Option<String> {
@@ -60,13 +61,35 @@ fn submit_form(form: forms::Form, selected: Option<usize>) -> Page {
             let title = extract_title(&html).unwrap_or_else(|| url.clone());
             let body = plain_text(&html);
             let forms = forms::parse(&html, &url);
-            Page { url, title, body, forms, status: format!("HTTP {status} · form submitted") }
+            Page { links: extract_links(&html, &url), url, title, body, forms, status: format!("HTTP {status} · form submitted") }
         }
         Err(message) => Page {
             url: form.action, title: "Form error".into(), body: message.clone(),
-            status: message, forms: Vec::new()
+            status: message, forms: Vec::new(), links: Vec::new()
         }
     }
+}
+
+fn extract_links(html: &str, base: &str) -> Vec<(String, String)> {
+    let doc = Html::parse_document(html);
+    let all = Selector::parse("a[href]").unwrap();
+    let base = match Url::parse(base) { Ok(u) => u, Err(_) => return Vec::new() };
+    let duckduckgo = base.host_str().map(|h| h.ends_with("duckduckgo.com")).unwrap_or(false);
+    let mut links = Vec::new();
+    for a in doc.select(&all) {
+        if duckduckgo && !a.value().classes().any(|c| c == "result-link" || c == "result__a") {
+            continue;
+        }
+        let title = a.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.is_empty() { continue; }
+        let href = a.value().attr("href").unwrap_or("");
+        let url = match base.join(href) { Ok(u) if matches!(u.scheme(), "http" | "https") => u.to_string(), _ => continue };
+        if !links.iter().any(|(_, u)| *u == url) {
+            links.push((title, url));
+        }
+        if links.len() >= 25 { break; }
+    }
+    links
 }
 
 fn extract_title(html: &str) -> Option<String> {
@@ -135,6 +158,9 @@ fn main() {
     toolbar.fixed(&go, 65);
     toolbar.end();
     column.fixed(&toolbar, 38);
+    let mut links_view = HoldBrowser::default();
+    links_view.set_text_size(15);
+    column.fixed(&links_view, 0);
     let mut display = TextDisplay::default();
     display.set_text_font(Font::Courier);
     display.set_text_size(15);
@@ -155,6 +181,7 @@ fn main() {
     let (wake_tx, wake_rx) = app::channel::<()>();
     let history = Rc::new(RefCell::new(Vec::<String>::new()));
 
+    let link_targets = Rc::new(RefCell::new(Vec::<String>::new()));
     let navigate = {
         let tx = tx.clone();
         let wake_tx = wake_tx.clone();
@@ -196,11 +223,32 @@ fn main() {
             }
         });
     }
+    {
+        let targets = link_targets.clone();
+        let navigate = navigate.clone();
+        links_view.set_callback(move |list| {
+            let selected = list.value();
+            if selected > 0 {
+                if let Some(url) = targets.borrow().get((selected - 1) as usize).cloned() {
+                    navigate(url);
+                }
+            }
+        });
+    }
     navigate("https://lite.duckduckgo.com/lite/".into());
     while app.wait() {
         if wake_rx.recv().is_some() {
             while let Ok(page) = rx.try_recv() {
-                status.set_label(&format!("{} · {} form(s)", page.status, page.forms.len()));
+                links_view.clear();
+                link_targets.borrow_mut().clear();
+                for (title, url) in &page.links {
+                    links_view.add(&title.replace('@', "@@").replace('\n', " "));
+                    link_targets.borrow_mut().push(url.clone());
+                }
+                let list_height = if page.links.is_empty() { 0 } else { (page.links.len().min(8) as i32) * 25 + 8 };
+                column.fixed(&links_view, list_height);
+                column.recalc();
+                status.set_label(&format!("{} · {} links", page.status, page.links.len()));
                 address.set_value(&page.url);
                 win.set_label(&format!("{} — Aster Browser", page.title));
                 buffer.set_text(&page.body);
@@ -213,5 +261,6 @@ fn main() {
 mod tests {
     use super::*;
     #[test] fn title() { assert_eq!(extract_title("<title>Hi &amp; bye</title>").as_deref(), Some("Hi & bye")); }
+    #[test] fn links() { assert_eq!(extract_links("<a href=\"/docs\">Docs</a>", "https://example.org/")[0].1, "https://example.org/docs"); }
     #[test] fn text() { assert!(!plain_text("<head><title>secret</title></head><p>Hello</p><script>evil()</script>").contains("evil")); }
 }
