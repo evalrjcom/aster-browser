@@ -142,9 +142,10 @@ fn main() {
     }
     {
         let navigate = navigate.clone();
-        let address = address.clone();
-        address.set_trigger(CallbackTrigger::EnterKey);
-        address.set_callback(move |_| navigate(address.value()));
+        let mut address_input = address.clone();
+        let address_for_callback = address_input.clone();
+        address_input.set_trigger(CallbackTrigger::EnterKey);
+        address_input.set_callback(move |_| navigate(address_for_callback.value()));
     }
     {
         let navigate = navigate.clone();
