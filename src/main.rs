@@ -1,5 +1,6 @@
+mod forms;
 use fltk::{
-    app, button::Button, enums::{Align, CallbackTrigger, Color, Font},
+    app, button::Button, dialog, enums::{Align, CallbackTrigger, Color, Font},
     frame::Frame, group::Flex, input::Input, prelude::*, text::{TextBuffer, TextDisplay},
     window::Window,
 };
@@ -7,7 +8,7 @@ use std::{cell::RefCell, rc::Rc, sync::mpsc, thread, time::Duration};
 use url::Url;
 
 #[derive(Clone)]
-struct Page { url: String, title: String, body: String, status: String }
+struct Page { url: String, title: String, body: String, status: String, forms: Vec<forms::Form> }
 
 fn fetch_page(input: String) -> Page {
     let url = if input.contains("://") { input } else if input.contains('.') && !input.contains(' ') {
@@ -17,7 +18,7 @@ fn fetch_page(input: String) -> Page {
         u.query_pairs_mut().append_pair("q", &input);
         u.to_string()
     };
-    let error = |message: String| Page { url: url.clone(), title: "Error".into(), body: message.clone(), status: message };
+    let error = |message: String| Page { url: url.clone(), title: "Error".into(), body: message.clone(), status: message, forms: Vec::new() };
     let parsed = match Url::parse(&url) { Ok(u) => u, Err(e) => return error(e.to_string()) };
     if !matches!(parsed.scheme(), "http" | "https") { return error("Only HTTP and HTTPS are supported".into()); }
     let client = match reqwest::blocking::Client::builder()
@@ -32,7 +33,57 @@ fn fetch_page(input: String) -> Page {
     let html = match response.text() { Ok(t) => t, Err(e) => return error(e.to_string()) };
     let title = extract_title(&html).unwrap_or_else(|| final_url.clone());
     let body = plain_text(&html);
-    Page { url: final_url, title, body, status: format!("HTTP {code} · text-only HTML prototype · JavaScript disabled") }
+    Page { url: final_url.clone(), title, body, forms: forms::parse(&html, &final_url), status: format!("HTTP {code} · HTML forms available · JavaScript disabled") }
+}
+
+fn submit_form(form: forms::Form, selected: Option<usize>) -> Page {
+    match forms::submit(&form, selected) {
+        Ok((url, html, status)) => {
+            let title = extract_title(&html).unwrap_or_else(|| url.clone());
+            let body = plain_text(&html);
+            let forms = forms::parse(&html, &url);
+            Page { url, title, body, forms, status: format!("HTTP {status} · form submitted") }
+        }
+        Err(message) => Page {
+            url: form.action, title: "Form error".into(), body: message.clone(),
+            status: message, forms: Vec::new()
+        }
+    }
+}
+
+fn edit_form(form: &mut forms::Form) -> Option<usize> {
+    let mut submit = None;
+    for (i, field) in form.controls.iter_mut().enumerate() {
+        if field.disabled { continue; }
+        match field.kind.as_str() {
+            "hidden" | "file" => continue,
+            "submit" => {
+                if submit.is_none() { submit = Some(i); }
+            }
+            "checkbox" | "radio" => {
+                let value = dialog::input_default(
+                    &format!("{} (checkbox/radio: yes or no)", field.label),
+                    if field.checked { "yes" } else { "no" }
+                )?;
+                field.checked = matches!(value.trim().to_ascii_lowercase().as_str(), "yes" | "y" | "true" | "1");
+            }
+            _ => {
+                let options = if field.kind == "select" {
+                    format!(" — choices: {}", field.options.iter().map(|(v,l)| format!("{l} ({v})")).collect::<Vec<_>>().join(", "))
+                } else { String::new() };
+                let value = dialog::input_default(
+                    &format!("{} [{}]{}", field.label, field.kind, options),
+                    &field.value
+                )?;
+                if field.required && value.trim().is_empty() {
+                    dialog::alert_default("This field is required.");
+                    return None;
+                }
+                field.value = value;
+            }
+        }
+    }
+    Some(submit.unwrap_or(usize::MAX))
 }
 
 fn extract_title(html: &str) -> Option<String> {
@@ -99,6 +150,8 @@ fn main() {
     address.set_value("https://example.org");
     let mut go = Button::default().with_label("Go");
     toolbar.fixed(&go, 65);
+    let mut form_button = Button::default().with_label("Forms");
+    toolbar.fixed(&form_button, 80);
     toolbar.end();
     column.fixed(&toolbar, 38);
     let mut display = TextDisplay::default();
@@ -120,6 +173,7 @@ fn main() {
     let (tx, rx) = mpsc::channel::<Page>();
     let (wake_tx, wake_rx) = app::channel::<()>();
     let history = Rc::new(RefCell::new(Vec::<String>::new()));
+    let active_forms = Rc::new(RefCell::new(Vec::<forms::Form>::new()));
     let navigate = {
         let tx = tx.clone();
         let wake_tx = wake_tx.clone();
@@ -161,10 +215,42 @@ fn main() {
             }
         });
     }
-    navigate("https://example.org".into());
+    {
+        let active_forms = active_forms.clone();
+        let tx = tx.clone();
+        let wake = wake_tx.clone();
+        form_button.set_callback(move |_| {
+            let available = active_forms.borrow().clone();
+            if available.is_empty() {
+                dialog::message_default("This page contains no HTML forms.");
+                return;
+            }
+            let form_number = if available.len() == 1 { 0 } else {
+                let answer = dialog::input_default(
+                    &format!("Choose form number (1-{})", available.len()), "1"
+                );
+                match answer.and_then(|s| s.parse::<usize>().ok()) {
+                    Some(n) if n >= 1 && n <= available.len() => n - 1,
+                    _ => return
+                }
+            };
+            let mut form = available[form_number].clone();
+            let selected = match edit_form(&mut form) { Some(i) => i, None => return };
+            let selected = if selected == usize::MAX { None } else { Some(selected) };
+            let tx = tx.clone();
+            let wake = wake.clone();
+            thread::spawn(move || {
+                let page = submit_form(form, selected);
+                let _ = tx.send(page);
+                wake.send(());
+            });
+        });
+    }
+    navigate("https://lite.duckduckgo.com/lite/".into());
     while app.wait() {
         if wake_rx.recv().is_some() {
             while let Ok(page) = rx.try_recv() {
+                *active_forms.borrow_mut() = page.forms.clone();
                 address.set_value(&page.url);
                 win.set_label(&format!("{} — Aster Browser", page.title));
                 buffer.set_text(&page.body);
