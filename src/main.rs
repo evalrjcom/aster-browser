@@ -11,16 +11,62 @@ use scraper::{Html, Selector};
 #[derive(Clone)]
 struct Page { url: String, title: String, body: String, status: String, forms: Vec<forms::Form>, links: Vec<(String, String)> }
 
-fn fetch_page(input: String) -> Page { fetch_page_inner(input, 0) }
+// Search prefixes: ddg:, google:, bing:, brave:, yahoo:, ecosia:, startpage:.
+fn resolve_address(input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() { return "https://lite.duckduckgo.com/lite/".into(); }
+    if let Some((prefix, query)) = input.split_once(':') {
+        let base = match prefix.to_ascii_lowercase().as_str() {
+            "ddg" | "duckduckgo" => Some("https://lite.duckduckgo.com/lite/"),
+            "google" => Some("https://www.google.com/search"),
+            "bing" => Some("https://www.bing.com/search"),
+            "brave" => Some("https://search.brave.com/search"),
+            "yahoo" => Some("https://search.yahoo.com/search"),
+            "ecosia" => Some("https://www.ecosia.org/search"),
+            "startpage" => Some("https://www.startpage.com/sp/search"),
+            _ => None,
+        };
+        if let Some(base) = base {
+            let mut url = Url::parse(base).unwrap();
+            url.query_pairs_mut().append_pair("q", query.trim());
+            return url.to_string();
+        }
+    }
+    if input.contains("://") { return input.to_string(); }
+    if !input.contains(char::is_whitespace) && (input.contains('.') || input.starts_with("localhost")) {
+        return format!("https://{input}");
+    }
+    let mut url = Url::parse("https://lite.duckduckgo.com/lite/").unwrap();
+    url.query_pairs_mut().append_pair("q", input);
+    url.to_string()
+}
+fn unwrap_search_redirect(input: &str) -> String {
+    let mut current = input.to_string();
+    for _ in 0..3 {
+        let parsed = match Url::parse(&current) { Ok(url) => url, Err(_) => break };
+        let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+        let is_ddg = matches!(host.as_str(), "duckduckgo.com" | "www.duckduckgo.com" | "links.duckduckgo.com" | "lite.duckduckgo.com");
+        let is_google = host == "www.google.com" || host == "google.com";
+        let is_bing = host == "www.bing.com" || host == "bing.com";
+        let candidate = if is_ddg && parsed.path().starts_with("/l/") {
+            parsed.query_pairs().find(|(k, _)| k == "uddg").map(|(_, v)| v.into_owned())
+        } else if is_google && parsed.path() == "/url" {
+            parsed.query_pairs().find(|(k, _)| k == "q" || k == "url").map(|(_, v)| v.into_owned())
+        } else if is_bing && parsed.path() == "/ck/a" {
+            // Bing uses an encoded redirect token; do not guess or decode unsupported formats.
+            None
+        } else { None };
+        let Some(candidate) = candidate else { break };
+        let Ok(target) = Url::parse(&candidate) else { break };
+        if !matches!(target.scheme(), "http" | "https") { break; }
+        current = target.to_string();
+    }
+    current
+}
+fn fetch_page(input: String) -> Page { fetch_page_inner(unwrap_search_redirect(&resolve_address(&input)), 0) }
 
 fn fetch_page_inner(input: String, redirect_depth: u8) -> Page {
-    let url = if input.contains("://") { input } else if input.contains('.') && !input.contains(' ') {
-        format!("https://{input}")
-    } else {
-        let mut u = Url::parse("https://lite.duckduckgo.com/lite/").unwrap();
-        u.query_pairs_mut().append_pair("q", &input);
-        u.to_string()
-    };
+    let url = unwrap_search_redirect(&resolve_address(&input));
     let error = |message: String| Page { url: url.clone(), title: "Error".into(), body: message.clone(), status: message, forms: Vec::new(), links: Vec::new() };
     let parsed = match Url::parse(&url) { Ok(u) => u, Err(e) => return error(e.to_string()) };
     if !matches!(parsed.scheme(), "http" | "https") { return error("Only HTTP and HTTPS are supported".into()); }
@@ -83,7 +129,7 @@ fn extract_links(html: &str, base: &str) -> Vec<(String, String)> {
         let title = a.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
         if title.is_empty() { continue; }
         let href = a.value().attr("href").unwrap_or("");
-        let url = match base.join(href) { Ok(u) if matches!(u.scheme(), "http" | "https") => u.to_string(), _ => continue };
+        let url = match base.join(href) { Ok(u) if matches!(u.scheme(), "http" | "https") => unwrap_search_redirect(u.as_str()), _ => continue };
         if !links.iter().any(|(_, u)| *u == url) {
             links.push((title, url));
         }
@@ -260,6 +306,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn ddg_redirect() {
+        assert_eq!(unwrap_search_redirect("https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.python.org%2F&rut=abc"), "https://www.python.org/");
+    }
+    #[test] fn google_redirect() {
+        assert_eq!(unwrap_search_redirect("https://www.google.com/url?q=https%3A%2F%2Fexample.org%2F"), "https://example.org/");
+    }
+    #[test] fn search_prefixes() {
+        assert!(resolve_address("bing: rust language").contains("www.bing.com/search?q=rust+language"));
+        assert!(resolve_address("google: hello").contains("google.com/search?q=hello"));
+        assert!(resolve_address("hello world").contains("lite.duckduckgo.com/lite/?q=hello+world"));
+    }
     #[test] fn title() { assert_eq!(extract_title("<title>Hi &amp; bye</title>").as_deref(), Some("Hi & bye")); }
     #[test] fn links() { assert_eq!(extract_links("<a href=\"/docs\">Docs</a>", "https://example.org/")[0].1, "https://example.org/docs"); }
     #[test] fn text() { assert!(!plain_text("<head><title>secret</title></head><p>Hello</p><script>evil()</script>").contains("evil")); }
