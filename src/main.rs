@@ -1,7 +1,7 @@
 mod forms;
 use fltk::{
-    app, button::Button, dialog, enums::{Align, CallbackTrigger, Color, Font},
-    frame::Frame, group::Flex, input::Input, prelude::*, text::{TextBuffer, TextDisplay},
+    app, button::{Button, CheckButton}, enums::{Align, CallbackTrigger, Color, Font},
+    frame::Frame, group::{Flex, Pack, Scroll}, input::{Input, SecretInput}, menu::Choice, prelude::*, text::{TextBuffer, TextDisplay},
     window::Window,
 };
 use std::{cell::RefCell, rc::Rc, sync::mpsc, thread, time::Duration};
@@ -14,7 +14,7 @@ fn fetch_page(input: String) -> Page {
     let url = if input.contains("://") { input } else if input.contains('.') && !input.contains(' ') {
         format!("https://{input}")
     } else {
-        let mut u = Url::parse("https://duckduckgo.com/").unwrap();
+        let mut u = Url::parse("https://lite.duckduckgo.com/lite/").unwrap();
         u.query_pairs_mut().append_pair("q", &input);
         u.to_string()
     };
@@ -31,9 +31,21 @@ fn fetch_page(input: String) -> Page {
     let code = response.status();
     let final_url = response.url().to_string();
     let html = match response.text() { Ok(t) => t, Err(e) => return error(e.to_string()) };
+    if let Some(target) = duckduckgo_lite_redirect(&final_url, &html) { return fetch_page(target); }
     let title = extract_title(&html).unwrap_or_else(|| final_url.clone());
     let body = plain_text(&html);
     Page { url: final_url.clone(), title, body, forms: forms::parse(&html, &final_url), status: format!("HTTP {code} · HTML forms available · JavaScript disabled") }
+}
+
+fn duckduckgo_lite_redirect(url: &str, html: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    if parsed.host_str()? != "duckduckgo.com" { return None; }
+    if !html.contains("non-JavaScript site") { return None; }
+    let mut target = Url::parse("https://lite.duckduckgo.com/lite/").ok()?;
+    for (key, value) in parsed.query_pairs() {
+        if key == "q" { target.query_pairs_mut().append_pair("q", &value); }
+    }
+    Some(target.to_string())
 }
 
 fn submit_form(form: forms::Form, selected: Option<usize>) -> Page {
@@ -49,41 +61,6 @@ fn submit_form(form: forms::Form, selected: Option<usize>) -> Page {
             status: message, forms: Vec::new()
         }
     }
-}
-
-fn edit_form(form: &mut forms::Form) -> Option<usize> {
-    let mut submit = None;
-    for (i, field) in form.controls.iter_mut().enumerate() {
-        if field.disabled { continue; }
-        match field.kind.as_str() {
-            "hidden" | "file" => continue,
-            "submit" => {
-                if submit.is_none() { submit = Some(i); }
-            }
-            "checkbox" | "radio" => {
-                let value = dialog::input_default(
-                    &format!("{} (checkbox/radio: yes or no)", field.label),
-                    if field.checked { "yes" } else { "no" }
-                )?;
-                field.checked = matches!(value.trim().to_ascii_lowercase().as_str(), "yes" | "y" | "true" | "1");
-            }
-            _ => {
-                let options = if field.kind == "select" {
-                    format!(" — choices: {}", field.options.iter().map(|(v,l)| format!("{l} ({v})")).collect::<Vec<_>>().join(", "))
-                } else { String::new() };
-                let value = dialog::input_default(
-                    &format!("{} [{}]{}", field.label, field.kind, options),
-                    &field.value
-                )?;
-                if field.required && value.trim().is_empty() {
-                    dialog::alert_default("This field is required.");
-                    return None;
-                }
-                field.value = value;
-            }
-        }
-    }
-    Some(submit.unwrap_or(usize::MAX))
 }
 
 fn extract_title(html: &str) -> Option<String> {
@@ -150,10 +127,14 @@ fn main() {
     address.set_value("https://example.org");
     let mut go = Button::default().with_label("Go");
     toolbar.fixed(&go, 65);
-    let mut form_button = Button::default().with_label("Forms");
-    toolbar.fixed(&form_button, 80);
     toolbar.end();
     column.fixed(&toolbar, 38);
+    let mut form_scroll = Scroll::default();
+    let mut form_pack = Pack::default().with_size(980, 1);
+    form_pack.set_spacing(5);
+    form_pack.end();
+    form_scroll.end();
+    column.fixed(&form_scroll, 0);
     let mut display = TextDisplay::default();
     display.set_text_font(Font::Courier);
     display.set_text_size(16);
@@ -173,7 +154,7 @@ fn main() {
     let (tx, rx) = mpsc::channel::<Page>();
     let (wake_tx, wake_rx) = app::channel::<()>();
     let history = Rc::new(RefCell::new(Vec::<String>::new()));
-    let active_forms = Rc::new(RefCell::new(Vec::<forms::Form>::new()));
+
     let navigate = {
         let tx = tx.clone();
         let wake_tx = wake_tx.clone();
@@ -215,46 +196,113 @@ fn main() {
             }
         });
     }
-    {
-        let active_forms = active_forms.clone();
-        let tx = tx.clone();
-        let wake = wake_tx.clone();
-        form_button.set_callback(move |_| {
-            let available = active_forms.borrow().clone();
-            if available.is_empty() {
-                dialog::message_default("This page contains no HTML forms.");
-                return;
-            }
-            let form_number = if available.len() == 1 { 0 } else {
-                let answer = dialog::input_default(
-                    &format!("Choose form number (1-{})", available.len()), "1"
-                );
-                match answer.and_then(|s| s.parse::<usize>().ok()) {
-                    Some(n) if n >= 1 && n <= available.len() => n - 1,
-                    _ => return
-                }
-            };
-            let mut form = available[form_number].clone();
-            let selected = match edit_form(&mut form) { Some(i) => i, None => return };
-            let selected = if selected == usize::MAX { None } else { Some(selected) };
-            let tx = tx.clone();
-            let wake = wake.clone();
-            thread::spawn(move || {
-                let page = submit_form(form, selected);
-                let _ = tx.send(page);
-                wake.send(());
-            });
-        });
-    }
     navigate("https://lite.duckduckgo.com/lite/".into());
     while app.wait() {
         if wake_rx.recv().is_some() {
             while let Ok(page) = rx.try_recv() {
-                *active_forms.borrow_mut() = page.forms.clone();
+                form_pack.clear();
+                let form_count = page.forms.len();
+                let mut total_height = 0;
+                for original_form in page.forms.clone() {
+                    let form_state = Rc::new(RefCell::new(original_form));
+                    let count = form_state.borrow().controls.iter().filter(|c| !c.disabled && c.kind != "hidden").count();
+                    if count == 0 { continue; }
+                    let mut row = Pack::default().with_size(form_scroll.w() - 24, 1);
+                    row.set_spacing(3);
+                    let mut form_height = 0;
+                    for (index, control) in form_state.borrow().controls.clone().into_iter().enumerate() {
+                        if control.disabled || control.kind == "hidden" { continue; }
+                        match control.kind.as_str() {
+                            "submit" => {
+                                let caption = if control.value.is_empty() { "Submit".to_string() } else { control.value.clone() };
+                                let mut button = Button::default().with_size(row.w(), 32).with_label(&caption);
+                                let state = form_state.clone();
+                                let tx = tx.clone();
+                                let wake = wake_tx.clone();
+                                button.set_callback(move |_| {
+                                    let form = state.borrow().clone();
+                                    let tx = tx.clone();
+                                    let wake = wake.clone();
+                                    thread::spawn(move || {
+                                        let result = submit_form(form, Some(index));
+                                        let _ = tx.send(result);
+                                        wake.send(());
+                                    });
+                                });
+                                form_height += 35;
+                            }
+                            "checkbox" | "radio" => {
+                                let mut check = CheckButton::default().with_size(row.w(), 28).with_label(&control.label);
+                                check.set_value(control.checked);
+                                let state = form_state.clone();
+                                check.set_callback(move |w| state.borrow_mut().controls[index].checked = w.value());
+                                form_height += 31;
+                            }
+                            "select" => {
+                                let mut choice = Choice::default().with_size(row.w(), 30);
+                                for (_, text) in &control.options { choice.add_choice(&text.replace('|', " ")); }
+                                let selected = control.options.iter().position(|(v,_)| *v == control.value).unwrap_or(0);
+                                choice.set_value(selected as i32);
+                                let state = form_state.clone();
+                                let options = control.options.clone();
+                                choice.set_callback(move |w| {
+                                    if let Some((value, _)) = options.get(w.value().max(0) as usize) {
+                                        state.borrow_mut().controls[index].value = value.clone();
+                                    }
+                                });
+                                form_height += 33;
+                            }
+                            "password" => {
+                                let mut field = SecretInput::default().with_size(row.w(), 30);
+                                field.set_value(&control.value);
+                                field.set_tooltip(&control.label);
+                                let state = form_state.clone();
+                                field.set_trigger(CallbackTrigger::Changed);
+                                field.set_callback(move |w| state.borrow_mut().controls[index].value = w.value());
+                                form_height += 33;
+                            }
+                            _ => {
+                                let mut field = Input::default().with_size(row.w(), 30);
+                                field.set_value(&control.value);
+                                field.set_tooltip(&control.label);
+                                let state = form_state.clone();
+                                field.set_trigger(CallbackTrigger::Changed);
+                                field.set_callback(move |w| state.borrow_mut().controls[index].value = w.value());
+                                form_height += 33;
+                            }
+                        }
+                    }
+                    // A form without a submit control can still be submitted with this button.
+                    if !form_state.borrow().controls.iter().any(|c| c.kind == "submit" && !c.disabled) {
+                        let mut button = Button::default().with_size(row.w(), 32).with_label("Submit");
+                        let state = form_state.clone();
+                        let tx = tx.clone();
+                        let wake = wake_tx.clone();
+                        button.set_callback(move |_| {
+                            let form = state.borrow().clone();
+                            let tx = tx.clone();
+                            let wake = wake.clone();
+                            thread::spawn(move || {
+                                let result = submit_form(form, None);
+                                let _ = tx.send(result);
+                                wake.send(());
+                            });
+                        });
+                        form_height += 35;
+                    }
+                    row.end();
+                    row.resize(row.x(), row.y(), row.w(), form_height.max(35));
+                    total_height += form_height.max(35) + 5;
+                }
+                form_pack.resize(form_pack.x(), form_pack.y(), form_scroll.w() - 24, total_height.max(1));
+                form_scroll.resize(form_scroll.x(), form_scroll.y(), form_scroll.w(), total_height.min(230));
+                column.fixed(&form_scroll, total_height.min(230));
+                column.recalc();
+                form_scroll.redraw();
+                status.set_label(&format!("{} · {} form(s) · JavaScript disabled", page.status, form_count));
                 address.set_value(&page.url);
                 win.set_label(&format!("{} — Aster Browser", page.title));
                 buffer.set_text(&page.body);
-                status.set_label(&page.status);
             }
         }
     }
