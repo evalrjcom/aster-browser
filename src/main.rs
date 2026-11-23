@@ -4,7 +4,7 @@ use fltk::{
     frame::Frame, group::Flex, input::Input, prelude::*, text::{TextBuffer, TextDisplay},
     window::Window,
 };
-use std::{cell::RefCell, rc::Rc, sync::{mpsc, atomic::{AtomicU64, Ordering}}, thread, time::Duration};
+use std::{io::Read, cell::RefCell, rc::Rc, sync::{mpsc, atomic::{AtomicU64, Ordering}}, thread, time::Duration};
 use url::Url;
 use scraper::{Html, Selector};
 
@@ -76,14 +76,18 @@ fn fetch_page_inner(input: String, redirect_depth: u8) -> Page {
         .build() {
             Ok(c) => c, Err(e) => return error(e.to_string())
         };
-    let response = match client.get(parsed).send() { Ok(r) => r, Err(e) => return error(e.to_string()) };
+    let mut response = match client.get(parsed).send() { Ok(r) => r, Err(e) => return error(e.to_string()) };
     let code = response.status();
     let final_url = response.url().to_string();
     // FIX: reject oversized responses before allocating a page-sized string.
     if response.content_length().is_some_and(|n| n > 8 * 1024 * 1024) {
         return error("Page exceeds 8 MiB safety limit".into());
     }
-    let bytes = match response.bytes() { Ok(b) => b, Err(e) => return error(e.to_string()) };
+    let mut bytes = Vec::new();
+    // FIX: take() enforces the limit even for chunked responses without Content-Length.
+    if let Err(e) = (&mut response).take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes) {
+        return error(e.to_string());
+    }
     if bytes.len() > 8 * 1024 * 1024 { return error("Page exceeds 8 MiB safety limit".into()); }
     let html = String::from_utf8_lossy(&bytes).into_owned();
     if redirect_depth == 0 {
