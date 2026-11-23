@@ -1,7 +1,7 @@
 mod forms;
 use fltk::{
-    app, button::{Button, CheckButton}, enums::{Align, CallbackTrigger, Color, Font},
-    frame::Frame, group::{Flex, Pack, Scroll}, input::{Input, SecretInput}, menu::Choice, prelude::*, text::{TextBuffer, TextDisplay},
+    app, button::Button, enums::{Align, CallbackTrigger, Color, Font},
+    frame::Frame, group::Flex, input::Input, prelude::*, text::{TextBuffer, TextDisplay},
     window::Window,
 };
 use std::{cell::RefCell, rc::Rc, sync::mpsc, thread, time::Duration};
@@ -130,20 +130,14 @@ fn main() {
     let mut back = Button::default().with_label("Back");
     toolbar.fixed(&back, 65);
     let mut address = Input::default();
-    address.set_value("https://example.org");
+    address.set_value("https://lite.duckduckgo.com/lite/");
     let mut go = Button::default().with_label("Go");
     toolbar.fixed(&go, 65);
     toolbar.end();
     column.fixed(&toolbar, 38);
-    let mut form_scroll = Scroll::default();
-    let mut form_pack = Pack::default().with_size(980, 1);
-    form_pack.set_spacing(5);
-    form_pack.end();
-    form_scroll.end();
-    column.fixed(&form_scroll, 0);
     let mut display = TextDisplay::default();
     display.set_text_font(Font::Courier);
-    display.set_text_size(16);
+    display.set_text_size(15);
     display.set_color(Color::White);
     let mut status = Frame::default().with_label("Ready");
     status.set_align(Align::Left | Align::Inside);
@@ -206,108 +200,7 @@ fn main() {
     while app.wait() {
         if wake_rx.recv().is_some() {
             while let Ok(page) = rx.try_recv() {
-                form_pack.clear();
-                form_pack.begin();
-                let form_count = page.forms.len();
-                let mut total_height = 0;
-                for original_form in page.forms.clone() {
-                    let form_state = Rc::new(RefCell::new(original_form));
-                    let count = form_state.borrow().controls.iter().filter(|c| !c.disabled && c.kind != "hidden").count();
-                    if count == 0 { continue; }
-                    let mut row = Pack::default().with_size(form_scroll.w() - 24, 1);
-                    row.set_spacing(3);
-                    let mut form_height = 0;
-                    for (index, control) in form_state.borrow().controls.clone().into_iter().enumerate() {
-                        if control.disabled || control.kind == "hidden" { continue; }
-                        match control.kind.as_str() {
-                            "submit" => {
-                                let caption = if control.value.is_empty() { "Submit".to_string() } else { control.value.clone() };
-                                let mut button = Button::default().with_size(row.w(), 32).with_label(&caption);
-                                let state = form_state.clone();
-                                let tx = tx.clone();
-                                let wake = wake_tx.clone();
-                                button.set_callback(move |_| {
-                                    let form = state.borrow().clone();
-                                    let tx = tx.clone();
-                                    let wake = wake.clone();
-                                    thread::spawn(move || {
-                                        let result = submit_form(form, Some(index));
-                                        let _ = tx.send(result);
-                                        wake.send(());
-                                    });
-                                });
-                                form_height += 35;
-                            }
-                            "checkbox" | "radio" => {
-                                let mut check = CheckButton::default().with_size(row.w(), 28).with_label(&control.label);
-                                check.set_value(control.checked);
-                                let state = form_state.clone();
-                                check.set_callback(move |w| state.borrow_mut().controls[index].checked = w.value());
-                                form_height += 31;
-                            }
-                            "select" => {
-                                let mut choice = Choice::default().with_size(row.w(), 30);
-                                for (_, text) in &control.options { choice.add_choice(&text.replace('|', " ")); }
-                                let selected = control.options.iter().position(|(v,_)| *v == control.value).unwrap_or(0);
-                                choice.set_value(selected as i32);
-                                let state = form_state.clone();
-                                let options = control.options.clone();
-                                choice.set_callback(move |w| {
-                                    if let Some((value, _)) = options.get(w.value().max(0) as usize) {
-                                        state.borrow_mut().controls[index].value = value.clone();
-                                    }
-                                });
-                                form_height += 33;
-                            }
-                            "password" => {
-                                let mut field = SecretInput::default().with_size(row.w(), 30);
-                                field.set_value(&control.value);
-                                field.set_tooltip(&control.label);
-                                let state = form_state.clone();
-                                field.set_trigger(CallbackTrigger::Changed);
-                                field.set_callback(move |w| state.borrow_mut().controls[index].value = w.value());
-                                form_height += 33;
-                            }
-                            _ => {
-                                let mut field = Input::default().with_size(row.w(), 30);
-                                field.set_value(&control.value);
-                                field.set_tooltip(&control.label);
-                                let state = form_state.clone();
-                                field.set_trigger(CallbackTrigger::Changed);
-                                field.set_callback(move |w| state.borrow_mut().controls[index].value = w.value());
-                                form_height += 33;
-                            }
-                        }
-                    }
-                    // A form without a submit control can still be submitted with this button.
-                    if !form_state.borrow().controls.iter().any(|c| c.kind == "submit" && !c.disabled) {
-                        let mut button = Button::default().with_size(row.w(), 32).with_label("Submit");
-                        let state = form_state.clone();
-                        let tx = tx.clone();
-                        let wake = wake_tx.clone();
-                        button.set_callback(move |_| {
-                            let form = state.borrow().clone();
-                            let tx = tx.clone();
-                            let wake = wake.clone();
-                            thread::spawn(move || {
-                                let result = submit_form(form, None);
-                                let _ = tx.send(result);
-                                wake.send(());
-                            });
-                        });
-                        form_height += 35;
-                    }
-                    row.end();
-                    row.resize(row.x(), row.y(), row.w(), form_height.max(35));
-                    total_height += form_height.max(35) + 5;
-                }
-                form_pack.end();
-                form_pack.resize(form_pack.x(), form_pack.y(), form_scroll.w() - 24, total_height.max(1));
-                form_scroll.resize(form_scroll.x(), form_scroll.y(), form_scroll.w(), total_height.min(230));
-                column.fixed(&form_scroll, total_height.min(230));
-                column.recalc();
-                form_scroll.redraw();
-                status.set_label(&format!("{} · {} form(s) · JavaScript disabled", page.status, form_count));
+                status.set_label(&format!("{} · {} form(s)", page.status, page.forms.len()));
                 address.set_value(&page.url);
                 win.set_label(&format!("{} — Aster Browser", page.title));
                 buffer.set_text(&page.body);
