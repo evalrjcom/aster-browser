@@ -10,7 +10,9 @@ use url::Url;
 #[derive(Clone)]
 struct Page { url: String, title: String, body: String, status: String, forms: Vec<forms::Form> }
 
-fn fetch_page(input: String) -> Page {
+fn fetch_page(input: String) -> Page { fetch_page_inner(input, 0) }
+
+fn fetch_page_inner(input: String, redirect_depth: u8) -> Page {
     let url = if input.contains("://") { input } else if input.contains('.') && !input.contains(' ') {
         format!("https://{input}")
     } else {
@@ -31,7 +33,11 @@ fn fetch_page(input: String) -> Page {
     let code = response.status();
     let final_url = response.url().to_string();
     let html = match response.text() { Ok(t) => t, Err(e) => return error(e.to_string()) };
-    if let Some(target) = duckduckgo_lite_redirect(&final_url, &html) { return fetch_page(target); }
+    if redirect_depth == 0 {
+        if let Some(target) = duckduckgo_lite_redirect(&final_url, &html) {
+            return fetch_page_inner(target, 1);
+        }
+    }
     let title = extract_title(&html).unwrap_or_else(|| final_url.clone());
     let body = plain_text(&html);
     Page { url: final_url.clone(), title, body, forms: forms::parse(&html, &final_url), status: format!("HTTP {code} · HTML forms available · JavaScript disabled") }
