@@ -63,7 +63,7 @@ pub fn parse(html: &str, base: &str) -> Vec<Form> {
                     let text = opt.text().collect::<String>().trim().to_owned();
                     let val = opt.value().attr("value").unwrap_or(&text).to_owned();
                     let selected = opt.value().attr("selected").is_some();
-                    if selected || options.is_empty() { value = val.clone(); }
+                    if selected || (options.is_empty() && value.is_empty()) { value = val.clone(); }
                     options.push((val, text));
                 }
             }
@@ -87,8 +87,10 @@ pub fn pairs(form: &Form, submit_index: Option<usize>) -> Vec<(String, String)> 
     let mut result = Vec::new();
     for (i, control) in form.controls.iter().enumerate() {
         if control.disabled || control.name.is_empty() { continue; }
-        if matches!(control.kind.as_str(), "file" | "reset" | "button") { continue; }
+        // FIX: only successful HTML controls are serialized; exclude non-data buttons.
+        if matches!(control.kind.as_str(), "file" | "reset" | "button" | "image") { continue; }
         if control.kind == "submit" && Some(i) != submit_index { continue; }
+        // FIX: unchecked and unnamed controls never contribute parameters.
         if matches!(control.kind.as_str(), "checkbox" | "radio") && !control.checked { continue; }
         result.push((control.name.clone(), control.value.clone()));
     }
@@ -122,7 +124,13 @@ pub fn submit(form: &Form, submit_index: Option<usize>) -> Result<(String, Strin
     }.map_err(|e| e.to_string())?;
     let status = response.status().to_string();
     let final_url = response.url().to_string();
-    let html = response.text().map_err(|e| e.to_string())?;
+    // FIX: limit response bodies to prevent unbounded allocations.
+    if response.content_length().is_some_and(|n| n > 8 * 1024 * 1024) {
+        return Err("Response exceeds 8 MiB safety limit".into());
+    }
+    let bytes = response.bytes().map_err(|e| e.to_string())?;
+    if bytes.len() > 8 * 1024 * 1024 { return Err("Response exceeds 8 MiB safety limit".into()); }
+    let html = String::from_utf8_lossy(&bytes).into_owned();
     Ok((final_url, html, status))
 }
 
@@ -148,6 +156,11 @@ mod tests {
         assert_eq!(pairs(&f[0], None), vec![("c".into(), "yes".into())]);
         f[0].controls[1].checked = true;
         assert_eq!(pairs(&f[0], None).len(), 2);
+    }
+    #[test]
+    fn selected_option_overrides_first_option() {
+        let forms = parse(r#"<form><select name="region"><option value="all">All</option><option value="us" selected>US</option></select></form>"#, "https://example.org/");
+        assert_eq!(pairs(&forms[0], None), vec![("region".into(), "us".into())]);
     }
     #[test]
     fn resolves_relative_actions() {
