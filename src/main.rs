@@ -201,6 +201,7 @@ fn main() {
         if wake_rx.recv().is_some() {
             while let Ok(page) = rx.try_recv() {
                 form_pack.clear();
+                form_pack.begin();
                 let form_count = page.forms.len();
                 let mut total_height = 0;
                 for original_form in page.forms.clone() {
@@ -294,6 +295,7 @@ fn main() {
                     row.resize(row.x(), row.y(), row.w(), form_height.max(35));
                     total_height += form_height.max(35) + 5;
                 }
+                form_pack.end();
                 form_pack.resize(form_pack.x(), form_pack.y(), form_scroll.w() - 24, total_height.max(1));
                 form_scroll.resize(form_scroll.x(), form_scroll.y(), form_scroll.w(), total_height.min(230));
                 column.fixed(&form_scroll, total_height.min(230));
